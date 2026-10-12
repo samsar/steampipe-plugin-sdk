@@ -844,7 +844,13 @@ func (d *QueryData) streamRow(row *proto.Row) {
 
 func (d *QueryData) streamError(err error) {
 	log.Printf("[WARN] QueryData StreamError %v (%s)", err, d.connectionCallId)
-	d.errorChan <- sperr.WrapWithMessage(err, "%s", d.Connection.Name)
+	// errorChan holds one error and streamRows stops reading once it has received one,
+	// so do not block if an error is already pending - the scan fails either way,
+	// and a blocked send would never return
+	select {
+	case d.errorChan <- sperr.WrapWithMessage(err, "%s", d.Connection.Name):
+	default:
+	}
 }
 
 // TODO KAI this seems to get called even after cancellation

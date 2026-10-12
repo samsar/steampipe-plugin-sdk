@@ -1,18 +1,24 @@
 package plugin_test
 
-// Regression test for a failed hydrate call that is lost.
+// Regression tests for two bugs in how a scan reports a failed hydrate call.
 //
-// streamRows waits in one select on errorChan and rowChan. When the last row
-// to complete fails, its error is sent on errorChan and then rowChan is
-// closed. If streamRows is busy sending a row while that happens, both
-// channels are ready at its next select and Go picks one at random: about half
-// the time the scan is reported as a success with the failed row missing.
+//   - Lost error. streamRows waits in one select on errorChan and rowChan. When
+//     the last row to complete fails, its error is sent on errorChan and then
+//     rowChan is closed. If streamRows is busy sending a row while that happens,
+//     both channels are ready at its next select and Go picks one at random:
+//     about half the time the scan is reported as a success with the failed row
+//     missing.
+//
+//   - Leaked goroutines. errorChan holds one error, and nothing reads it after
+//     streamRows has returned. When more rows fail after that, each sender
+//     blocks forever.
 //
 // Run:  go test -race -run 'TestExecute.*Fail' ./plugin/
 
 import (
 	"context"
 	"errors"
+	"runtime"
 	"testing"
 	"time"
 
@@ -27,9 +33,11 @@ import (
 const (
 	scanErrorConnection = "scan_error_fixture"
 	lastRowFailsTable   = "last_row_fails"
+	allRowsFailTable    = "all_rows_fail"
 	// the stream holds the first row, the output channel buffers the second,
 	// and streamRows blocks sending the third while the fourth fails
 	lastRowFailsRows = 4
+	allRowsFailRows  = 10
 )
 
 type scanErrorItem struct {
@@ -47,6 +55,13 @@ func listLastRowFailsItems(ctx context.Context, d *plugin.QueryData, _ *plugin.H
 	return nil, nil
 }
 
+func listAllRowsFailItems(ctx context.Context, d *plugin.QueryData, _ *plugin.HydrateData) (any, error) {
+	for i := 0; i < allRowsFailRows; i++ {
+		d.StreamListItem(ctx, scanErrorItem{ID: i})
+	}
+	return nil, nil
+}
+
 // lastRowFailsDetail succeeds for every row except the last one, which fails
 // (after the gate in the context is closed, if there is one).
 func lastRowFailsDetail(ctx context.Context, _ *plugin.QueryData, h *plugin.HydrateData) (any, error) {
@@ -57,6 +72,10 @@ func lastRowFailsDetail(ctx context.Context, _ *plugin.QueryData, h *plugin.Hydr
 		<-gate
 	}
 	return nil, errors.New("hydrate failed on the last row")
+}
+
+func allRowsFailDetail(context.Context, *plugin.QueryData, *plugin.HydrateData) (any, error) {
+	return nil, errors.New("hydrate failed on every row")
 }
 
 func scanErrorFixturePlugin(_ context.Context) *plugin.Plugin {
@@ -73,6 +92,11 @@ func scanErrorFixturePlugin(_ context.Context) *plugin.Plugin {
 				Name:    lastRowFailsTable,
 				List:    &plugin.ListConfig{Hydrate: listLastRowFailsItems},
 				Columns: columns(lastRowFailsDetail),
+			},
+			allRowsFailTable: {
+				Name:    allRowsFailTable,
+				List:    &plugin.ListConfig{Hydrate: listAllRowsFailItems},
+				Columns: columns(allRowsFailDetail),
 			},
 		},
 	}
@@ -166,5 +190,41 @@ func TestExecuteReturnsErrorWhenLastRowFails(t *testing.T) {
 		if err := executeScan(server, lastRowFailsTable, stream); err == nil {
 			t.Fatalf("scan %d: Execute returned no error, but the hydrate call for the last row failed", i)
 		}
+	}
+}
+
+// TestExecuteDoesNotLeakGoroutinesWhenEveryRowFails runs scans in which every
+// hydrate call fails. Without the fix, every error after the first two blocks
+// its sender forever, so the goroutine count grows with each scan.
+func TestExecuteDoesNotLeakGoroutinesWhenEveryRowFails(t *testing.T) {
+	const (
+		scans = 20
+		slack = 10
+	)
+	server := newScanErrorServer(t)
+	scan := func() {
+		t.Helper()
+		if err := executeScan(server, allRowsFailTable, &executeStream{ctx: context.Background()}); err == nil {
+			t.Fatal("Execute returned no error, but every hydrate call failed")
+		}
+	}
+
+	// the first scan starts any long-lived goroutines, so count from after it
+	scan()
+	time.Sleep(100 * time.Millisecond)
+	before := runtime.NumGoroutine()
+
+	for i := 0; i < scans; i++ {
+		scan()
+	}
+
+	// goroutines of the last scans may still be finishing
+	after := runtime.NumGoroutine()
+	for deadline := time.Now().Add(5 * time.Second); after > before+slack && time.Now().Before(deadline); {
+		time.Sleep(50 * time.Millisecond)
+		after = runtime.NumGoroutine()
+	}
+	if after > before+slack {
+		t.Fatalf("goroutines grew from %d to %d after %d scans in which every hydrate call failed", before, after, scans)
 	}
 }
